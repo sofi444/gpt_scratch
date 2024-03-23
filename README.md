@@ -1,1 +1,2 @@
-# gpt_scratch
+
+# GPT from scratch
