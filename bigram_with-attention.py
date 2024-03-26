@@ -35,6 +35,7 @@ max_iters = 5000
 eval_interval = 500
 eval_iters = 200
 lr = 1e-3
+dropout_rate = 0.1
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 if dev:
     max_iters = 50
@@ -103,6 +104,8 @@ class AttentionHead(nn.Module):
         # lower triangular matrix
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout_rate)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x) # (B,T,head_size) - unit gaussian (var:1)
@@ -129,6 +132,8 @@ class AttentionHead(nn.Module):
         # important tokens will get higher values
         # more info from those tokens will be aggregated into current timestep idx
         weight = F.softmax(weight, dim=-1) # (B,T,T)
+
+        weight = self.dropout(weight) # prevent some of the node from communicating
         
         # weighted average of values
         # propagate through lin layer and aggregate the resulting value, not the token itself
@@ -147,10 +152,12 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([AttentionHead(head_size) for _ in range(n_heads)])
         self.projection = nn.Linear(n_embed, n_embed) # for skip connections
+        self.dropout = nn.Dropout(dropout_rate)
         
     def forward(self, x):
         out = torch.cat([head(x) for head in self.heads], dim=-1)
         out = self.projection(out) # project back to the residual pathway
+        out = self.dropout(out)
         return out
 
 
@@ -165,6 +172,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embed, n_embed * 4), # dim (channel size) of the inner layer is 4x (from Transformer paper)
             nn.ReLU(),
             nn.Linear(n_embed * 4, n_embed), # projection back to the residual pathway
+            nn.Dropout(dropout_rate),
         )
 
     def forward(self, x):
@@ -184,14 +192,23 @@ class TransformerBlock(nn.Module):
         head_size = n_embed // n_heads
         self.selfattention_heads = MultiHeadAttention(n_heads, head_size)
         self.feedforward = FeedForward(n_embed)
+        self.layernorm1 = nn.LayerNorm(n_embed)
+        self.layernorm2 = nn.LayerNorm(n_embed)
+
 
     def forward(self, x):
         #x = self.selfattention_heads(x)
         #x = self.feedforward(x)
 
-        # add residual connections
+        ''' residual connections '''
         x = x + self.selfattention_heads(x)
         x = x + self.feedforward(x)
+
+        ''' residual connections + layer normalization '''
+        # variation from the Transformer paper:
+        # layer normalization is applied directly on the input (instead of after attention/FF)
+        x = x + self.selfattention_heads(self.layernorm1(x))
+        x = x + self.feedforward(self.layernorm2(x))
 
         return x
 
@@ -217,11 +234,13 @@ class BigramLanguageModel(nn.Module):
             TransformerBlock(n_embed, n_heads),
             TransformerBlock(n_embed, n_heads),
             TransformerBlock(n_embed, n_heads),
+            nn.LayerNorm(n_embed) # norm always at the end of the network
         )
         # ! network is becoming quite deep -> optmization issues (vanishing gradients)
-        # -> add residual connections (skip connections) + dropout
+        # -> add residual connections (skip connections) + layer norm
 
-        self.lm_head = nn.Linear(n_embed, vocab_size) # get logits
+        # linear layer that decoded into vocabulary space (get logits for each token in the vocab)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
