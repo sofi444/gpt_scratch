@@ -1,6 +1,7 @@
 
 import os
 import math
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -27,16 +28,19 @@ vocab_size = tokenizer.vocab_size
 
 # hyperparameters
 batch_size = 16
-block_size = 8 # context
-n_embed = 32 # embedding size
-n_heads = 4 # self-attention heads
+block_size = 32 # context
+n_embed = 192 # embedding size (n_embed//n_heads = head_size)
+n_heads = 6 # self-attention heads
+n_blocks = 4 # transformer blocks (layers)
 max_new_tokens = 1000
-max_iters = 5000
+max_iters = 3000
 eval_interval = 500
 eval_iters = 200
 lr = 1e-3
 dropout_rate = 0.1
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 if dev:
     max_iters = 50
     eval_interval = 10
@@ -76,7 +80,7 @@ def estimate_loss():
     -> more robust measurement of the current loss (depends on the batch)
     '''
     loss_tracker = {}
-    model.eval() # eval mode (currently makes no difference - only lookup table)
+    model.eval() # eval mode
 
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
@@ -231,13 +235,12 @@ class BigramLanguageModel(nn.Module):
         #self.feedforward = FeedForward(n_embed)
         ''' transformer blocks '''
         self.blocks = nn.Sequential(
-            TransformerBlock(n_embed, n_heads),
-            TransformerBlock(n_embed, n_heads),
-            TransformerBlock(n_embed, n_heads),
-            nn.LayerNorm(n_embed) # norm always at the end of the network
+            *[TransformerBlock(n_embed, n_heads) for _ in range(n_blocks)]
         )
-        # ! network is becoming quite deep -> optmization issues (vanishing gradients)
+        # ! deep network -> optmization issues (vanishing gradients)
         # -> add residual connections (skip connections) + layer norm
+
+        self.final_layernorm = nn.LayerNorm(n_embed) # norm always at the end of the network
 
         # linear layer that decoded into vocabulary space (get logits for each token in the vocab)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -272,8 +275,6 @@ class BigramLanguageModel(nn.Module):
             # will just return the logits
             loss = None
         else:
-            # logits: the dimension corresponding to the correct target
-            # should have a high number (the others low)
             # ! need to resize to match input that pytorch expects for CE
             # ! for multidim input, the channel should be the 2nd dim (B, C, T)
             # ! instead, transform into a 2d array
@@ -309,8 +310,7 @@ class BigramLanguageModel(nn.Module):
             # (loss will be ignored; no correct targets to compare with)
             logits, loss = self(idx_con)
 
-            # focus only on the last time step (last idx == last token)
-            # (because it is a bigram model)
+            # bigram model: focus only on the last time step (last idx == last token)
             logits = logits[:, -1, :] # becomes (B, C)
 
             # apply softmax to get probabilities
@@ -332,7 +332,7 @@ model = model.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
 # training loop
-for iter in range(max_iters):
+for iter in tqdm(range(max_iters)):
     
     x, y = get_batch('train')
     x, y = x.to(device), y.to(device)
